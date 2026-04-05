@@ -8,7 +8,7 @@ DATA_HUB = {}
 DATA_HUB['time_machine'] = (DATA_URL + 'timemachine.txt',
                             '090b5e7e70c295757f55df93cb0a180b9691891a')
 
-def download(name, cache_dir=os.path.join('..', 'data')):
+def download(name, cache_dir=os.path.join('.', 'data')):
     """下载DATA_HUB中的文件并返回本地文件名"""
     assert name in DATA_HUB, f"{name} 不存在于 {DATA_HUB}"
     url, sha1_hash = DATA_HUB[name]
