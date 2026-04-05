@@ -6,6 +6,7 @@ import torchvision.transforms as transforms
 from torchvision.models import resnet18, ResNet18_Weights
 from tqdm import tqdm
 import time
+import os  # 用于检查文件是否存在
 
 # 设置设备
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -151,6 +152,21 @@ def test(model, loader, criterion):
 
 
 # ========== 5. 主训练循环 ==========
+# 检查是否存在已保存的模型权重
+if os.path.exists('best_resnet18_cifar10.pth'):
+    print("\n>>> 发现已保存的模型，加载权重并跳过训练...")
+    model.load_state_dict(torch.load('best_resnet18_cifar10.pth', map_location=device))
+    
+    # 直接进行测试
+    test_loss, test_acc = test(model, test_loader, criterion)
+    print(f'\n加载模型测试结果 - Loss: {test_loss:.4f} | Acc: {test_acc:.2f}%')
+    
+    # 退出程序
+    import sys
+    sys.exit(0)
+
+print("\n>>> 未找到保存的模型，开始训练...")
+
 num_epochs = 30
 best_acc = 0
 
