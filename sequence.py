@@ -147,6 +147,7 @@ for i in range(tau):
 # 这是链式自回归：第k步预测基于第k-1步的预测结果
 for i in range(tau, tau + max_steps):
     features[:, i] = net(features[:, i - tau:i]).reshape(-1)
+print("特征矩阵形状:", features.shape)
 
 # 绘制不同步长的预测效果
 steps = (1, 4, 16, 64)  # 定义要绘制的预测步长：1步、4步、16步、64步
