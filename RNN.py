@@ -458,7 +458,7 @@ def main():
     print("步骤2: 构建词汇表")
     print("="*50)
     vocab = Vocabulary()
-    vocab.build_vocab(words, min_freq=2)
+    vocab.build_vocab(words, min_freq=1)  # 包含所有词，减少<UNK>
     
     # 3. 构造数据集
     print("\n" + "="*50)
