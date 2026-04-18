@@ -12,6 +12,8 @@ import urllib.request
 import os
 import re
 import random
+import matplotlib.pyplot as plt
+from collections import deque
 
 
 # ==================== 超参数配置 ====================
@@ -22,7 +24,7 @@ BATCH_SIZE = 32       # 批量大小
 NUM_LAYERS = 1        # RNN层数
 EPOCHS = 50           # 训练轮数
 LEARNING_RATE = 0.001 # 学习率
-GENERATE_LEN = 50     # 续写文本长度
+GENERATE_LEN = 100    # 续写文本长度
 DATA_PATH = './data/timemachine.txt'
 DATA_URL = 'https://raw.githubusercontent.com/d2l-ai/d2l-en/master/data/timemachine.txt'
 
@@ -191,7 +193,19 @@ def train_model(model, dataloader, epochs, device):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
+    # 初始化实时loss曲线
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Training Loss (Real-time)')
+    line, = ax.plot([], [], 'b-', linewidth=2)
+    loss_history = deque(maxlen=epochs)
+    epoch_list = deque(maxlen=epochs)
+    
     print("\n开始训练...")
+    print("训练过程中会显示实时loss曲线窗口...")
+    
     for epoch in range(epochs):
         total_loss = 0
         
@@ -224,10 +238,116 @@ def train_model(model, dataloader, epochs, device):
             total_loss += loss.item()
         
         avg_loss = total_loss / len(dataloader)
+        
+        # 更新loss历史
+        loss_history.append(avg_loss)
+        epoch_list.append(epoch + 1)
+        
+        # 实时更新图表
+        line.set_xdata(list(epoch_list))
+        line.set_ydata(list(loss_history))
+        ax.relim()
+        ax.autoscale_view()
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title(f'Training Loss (Real-time) - Epoch {epoch+1}/{epochs}')
+        plt.draw()
+        plt.pause(0.001)  # 非阻塞更新
+        
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
     
-    print("训练完成！")
+    plt.ioff()
+    print("训练完成！关闭loss曲线窗口后继续...")
+    plt.show()  # 阻塞等待用户关闭窗口
+
+
+# ==================== 原文比对功能 ====================
+ORIGINAL_TEXT = ""  # 存储原始文本用于比对
+
+def check_originality(generated_words, min_match_len=5):
+    """
+    检测生成文本与原文的重复情况
+    返回: (原创度百分比, 重复片段列表)
+    """
+    if not ORIGINAL_TEXT or len(generated_words) < min_match_len:
+        return 100.0, []
+    
+    # 将原文转为单词列表（统一小写）
+    original_words = ORIGINAL_TEXT.lower().split()
+    
+    # 将生成文本转为小写单词列表
+    gen_lower = [w.lower() for w in generated_words]
+    
+    # 检测连续匹配的n-gram
+    matched_positions = set()  # 记录被匹配的位置
+    repeated_phrases = []
+    
+    # 从长到短检测，优先检测长片段
+    for n in range(min(min_match_len + 10, len(gen_lower)), min_match_len - 1, -1):
+        for i in range(len(gen_lower) - n + 1):
+            if i in matched_positions:  # 跳过已被长片段覆盖的位置
+                continue
+            
+            ngram = gen_lower[i:i+n]
+            
+            # 检查是否在原文中
+            for j in range(len(original_words) - n + 1):
+                if original_words[j:j+n] == ngram:
+                    # 记录匹配
+                    for k in range(i, i+n):
+                        matched_positions.add(k)
+                    phrase = ' '.join(generated_words[i:i+n])
+                    repeated_phrases.append((i, n, phrase))
+                    break
+    
+    # 计算原创度
+    originality = (1 - len(matched_positions) / len(gen_lower)) * 100 if gen_lower else 100
+    
+    # 去重并按位置排序
+    seen = set()
+    unique_phrases = []
+    for pos, length, phrase in sorted(repeated_phrases, key=lambda x: (x[0], -x[1])):
+        if phrase.lower() not in seen:
+            seen.add(phrase.lower())
+            unique_phrases.append((pos, length, phrase))
+    
+    return originality, unique_phrases
+
+
+def highlight_repeats(generated_words, repeated_phrases):
+    """高亮显示重复片段 [重复内容]"""
+    if not repeated_phrases:
+        return ' '.join(generated_words)
+    
+    # 标记哪些位置是重复的
+    repeat_positions = set()
+    for pos, length, _ in repeated_phrases:
+        for i in range(pos, pos + length):
+            repeat_positions.add(i)
+    
+    # 构建带高亮的文本
+    result = []
+    in_repeat = False
+    
+    for i, word in enumerate(generated_words):
+        if i in repeat_positions:
+            if not in_repeat:
+                result.append('[')
+                in_repeat = True
+        else:
+            if in_repeat:
+                result.append(']')
+                in_repeat = False
+        result.append(word)
+    
+    if in_repeat:
+        result.append(']')
+    
+    # 美化输出：方括号与内容间不加空格
+    text = ' '.join(result)
+    text = text.replace(' [ ', ' [').replace(' ] ', '] ')
+    return text
 
 
 # ==================== 推理与生成 ====================
@@ -285,7 +405,27 @@ def generate_text(model, vocab, seed_text, generate_len, device):
     
     # 将索引转换为单词
     generated_words = vocab.decode(generated_indices)
-    return ' '.join(generated_words)
+    
+    # 比对原文，检测重复
+    originality, repeated_phrases = check_originality(generated_words, min_match_len=4)
+    
+    # 高亮显示重复片段
+    highlighted = highlight_repeats(generated_words, repeated_phrases)
+    
+    # 构建结果字符串
+    result_lines = [highlighted]
+    result_lines.append(f"\n[原创度分析] 原创度: {originality:.1f}%")
+    
+    if repeated_phrases:
+        result_lines.append(f"发现 {len(repeated_phrases)} 处与原文重复:")
+        for i, (_, _, phrase) in enumerate(repeated_phrases[:5], 1):  # 最多显示5个
+            result_lines.append(f"  {i}. \"{phrase}\"")
+        if len(repeated_phrases) > 5:
+            result_lines.append(f"  ... 还有 {len(repeated_phrases)-5} 处重复")
+    else:
+        result_lines.append("未发现与原文的连续重复片段")
+    
+    return '\n'.join(result_lines)
 
 
 # ==================== 主程序 ====================
@@ -308,6 +448,10 @@ def main():
     words = tokenize(text)
     print(f"文本总词数: {len(words)}")
     print(f"示例前20词: {' '.join(words[:20])}")
+    
+    # 保存原始文本用于比对（保持小写格式）
+    global ORIGINAL_TEXT
+    ORIGINAL_TEXT = ' '.join(words)
     
     # 2. 构建词汇表
     print("\n" + "="*50)
