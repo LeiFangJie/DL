@@ -146,7 +146,8 @@ class LSTMModel(nn.Module):
             input_size=embedding_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            batch_first=True
+            batch_first=True,
+            dropout=0.3 if num_layers > 1 else 0
         )
         
         # 全连接输出层
