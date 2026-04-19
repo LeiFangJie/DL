@@ -17,11 +17,11 @@ from collections import deque
 
 
 # ==================== 超参数配置 ====================
-SEQ_LEN = 64          # 序列长度
+SEQ_LEN = 32          # 序列长度
 EMBEDDING_DIM = 128   # 词向量维度
-HIDDEN_SIZE = 512     # LSTM隐藏单元数
-BATCH_SIZE = 64       # 批量大小
-NUM_LAYERS = 3        # LSTM层数
+HIDDEN_SIZE = 256     # LSTM隐藏单元数
+BATCH_SIZE = 32       # 批量大小
+NUM_LAYERS = 1        # LSTM层数
 EPOCHS = 50           # 训练轮数
 LEARNING_RATE = 0.001 # 学习率
 GENERATE_LEN = 100    # 续写文本长度
@@ -146,8 +146,7 @@ class LSTMModel(nn.Module):
             input_size=embedding_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            batch_first=True,
-            dropout=0.3 if num_layers > 1 else 0
+            batch_first=True
         )
         
         # 全连接输出层
