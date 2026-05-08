@@ -189,112 +189,216 @@ for X, X_valid_len, Y, Y_valid_len in train_iter:
     print('Y:', Y.type(torch.int32))
     print('Y的有效长度:', Y_valid_len)
     break
-#=========================编码器，解码器======================================
-#@save
-class Seq2SeqEncoder(nn.Module):
-    """用于序列到序列学习的循环神经网络编码器"""
-    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers,
-                 dropout=0, **kwargs):
-        super(Seq2SeqEncoder, self).__init__(**kwargs)
-        # 嵌入层
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.rnn = nn.GRU(embed_size, num_hiddens, num_layers,
-                          dropout=dropout)
 
-    def forward(self, X, *args):
-        # 输出'X'的形状：(batch_size,num_steps,embed_size)
-        X = self.embedding(X)
-        # 在循环神经网络模型中，第一个轴对应于时间步
-        X = X.permute(1, 0, 2)
-        # 如果未提及状态，则默认为0
-        output, state = self.rnn(X)
-        # output的形状:(num_steps,batch_size,num_hiddens)
-        # state的形状:(num_layers,batch_size,num_hiddens)
-        return output, state
 
-# encoder = Seq2SeqEncoder(vocab_size=10, embed_size=8, num_hiddens=16,
-#                          num_layers=2)
-# encoder.eval()
-# X = torch.zeros((4, 7), dtype=torch.long)
-# output, state = encoder(X)
-# print("输出形状:", output.shape)
-# print("状态形状:", state.shape)
+# ==================== Transformer 实现 ====================
 
-class BahdanauAttention(nn.Module):
-    """Bahdanau注意力机制"""
-    def __init__(self, num_hiddens, dropout=0, **kwargs):
-        super(BahdanauAttention, self).__init__(**kwargs)
-        self.W_k = nn.Linear(num_hiddens, num_hiddens, bias=False)
-        self.W_q = nn.Linear(num_hiddens, num_hiddens, bias=False)
-        self.w_v = nn.Linear(num_hiddens, 1, bias=False)
+class PositionalEncoding(nn.Module):
+    """位置编码"""
+    def __init__(self, num_hiddens, dropout, max_len=1000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        # 创建一个足够长的位置编码矩阵
+        self.P = torch.zeros((1, max_len, num_hiddens))
+        X = torch.arange(max_len, dtype=torch.float32).reshape(
+            -1, 1) / torch.pow(10000, torch.arange(
+            0, num_hiddens, 2, dtype=torch.float32) / num_hiddens)
+        self.P[:, :, 0::2] = torch.sin(X)
+        self.P[:, :, 1::2] = torch.cos(X)
+
+    def forward(self, X):
+        X = X + self.P[:, :X.shape[1], :].to(X.device)
+        return self.dropout(X)
+
+
+class MultiHeadAttention(nn.Module):
+    """多头注意力"""
+    def __init__(self, key_size, query_size, value_size, num_hiddens,
+                 num_heads, dropout, bias=False, **kwargs):
+        super(MultiHeadAttention, self).__init__(**kwargs)
+        self.num_heads = num_heads
+        self.attention = nn.MultiheadAttention(num_hiddens, num_heads, dropout, bias=bias, batch_first=True)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries, keys, values, valid_lens):
-        queries, keys = self.W_q(queries), self.W_k(keys)
-        features = queries.unsqueeze(2) + keys.unsqueeze(1)
-        scores = self.w_v(features).squeeze(-1)
-        self.attention_weights = self.masked_softmax(scores, valid_lens)
-        context = torch.bmm(self.dropout(self.attention_weights), values)
-        return context, self.attention_weights
+    def forward(self, queries, keys, values, attn_mask=None, key_padding_mask=None):
+        """
+        queries, keys, values: [batch_size, seq_len, num_hiddens]
+        attn_mask: 自注意力掩码（防止看到未来信息）
+        key_padding_mask: 填充掩码 [batch_size, seq_len]
+        """
+        output, attn_weights = self.attention(
+            queries, keys, values, 
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=True,
+            average_attn_weights=False
+        )
+        return output, attn_weights
 
-    def masked_softmax(self, X, valid_lens):#attention mask
-        if valid_lens is None:
-            return nn.functional.softmax(X, dim=-1)
-        shape = X.shape
-        # X shape: [batch_size, tgt_len, src_len] for attention
-        if valid_lens.dim() == 1:
-            # valid_lens: [batch_size], expand to [batch_size, 1, src_len] for broadcasting
-            mask = torch.arange((X.size(-1)), dtype=torch.float32,
-                                device=X.device)[None, :] < valid_lens[:, None, None]
-        else:
-            valid_lens = valid_lens.reshape(-1)
-            mask = torch.arange((X.size(-1)), dtype=torch.float32,
-                                device=X.device)[None, :] < valid_lens[:, None]
-        X = X.masked_fill(~mask, -1e6)
-        return nn.functional.softmax(X, dim=-1)
 
-class AttentionDecoder(nn.Module):
-    """带有Bahdanau注意力的解码器"""
-    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers,
-                 dropout=0, **kwargs):
-        super(AttentionDecoder, self).__init__(**kwargs)
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.attention = BahdanauAttention(num_hiddens, dropout)
-        self.rnn = nn.GRU(embed_size + num_hiddens, num_hiddens, num_layers,
-                          dropout=dropout)
-        self.dense = nn.Linear(num_hiddens, vocab_size)
+class PositionWiseFFN(nn.Module):
+    """基于位置的前馈网络"""
+    def __init__(self, ffn_num_input, ffn_num_hiddens, ffn_num_outputs,
+                 **kwargs):
+        super(PositionWiseFFN, self).__init__(**kwargs)
+        self.dense1 = nn.Linear(ffn_num_input, ffn_num_hiddens)
+        self.relu = nn.ReLU()
+        self.dense2 = nn.Linear(ffn_num_hiddens, ffn_num_outputs)
 
-    def init_state(self, enc_outputs, enc_valid_lens, *args):
-        outputs, hidden_state = enc_outputs
-        return (outputs.permute(1, 0, 2), hidden_state, enc_valid_lens)
+    def forward(self, X):
+        return self.dense2(self.relu(self.dense1(X)))
+
+
+class AddNorm(nn.Module):
+    """残差连接和层归一化"""
+    def __init__(self, normalized_shape, dropout, **kwargs):
+        super(AddNorm, self).__init__(**kwargs)
+        self.dropout = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm(normalized_shape)
+
+    def forward(self, X, Y):
+        return self.ln(self.dropout(Y) + X)
+
+
+class TransformerEncoderBlock(nn.Module):
+    """Transformer编码器块"""
+    def __init__(self, num_hiddens, ffn_num_hiddens, num_heads,
+                 dropout, use_bias=False, **kwargs):
+        super(TransformerEncoderBlock, self).__init__(**kwargs)
+        self.attention = MultiHeadAttention(
+            num_hiddens, num_hiddens, num_hiddens, num_hiddens, num_heads,
+            dropout, use_bias)
+        self.addnorm1 = AddNorm(num_hiddens, dropout)
+        self.ffn = PositionWiseFFN(num_hiddens, ffn_num_hiddens, num_hiddens)
+        self.addnorm2 = AddNorm(num_hiddens, dropout)
+
+    def forward(self, X, valid_lens=None):
+        # 自注意力，使用key_padding_mask处理填充
+        key_padding_mask = None
+        if valid_lens is not None:
+            # 创建填充掩码 [batch_size, seq_len]
+            key_padding_mask = (torch.arange(X.shape[1], device=X.device)[None, :] >= valid_lens[:, None])
+        
+        Y, _ = self.attention(X, X, X, key_padding_mask=key_padding_mask)
+        Y = self.addnorm1(X, Y)
+        return self.addnorm2(Y, self.ffn(Y))
+
+
+class TransformerEncoder(nn.Module):
+    """Transformer编码器"""
+    def __init__(self, vocab_size, num_hiddens, ffn_num_hiddens,
+                 num_heads, num_layers, dropout, **kwargs):
+        super(TransformerEncoder, self).__init__(**kwargs)
+        self.num_hiddens = num_hiddens
+        self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.pos_encoding = PositionalEncoding(num_hiddens, dropout)
+        self.blks = nn.Sequential()
+        for i in range(num_layers):
+            self.blks.add_module(f"block{i}",
+                TransformerEncoderBlock(
+                    num_hiddens, ffn_num_hiddens, num_heads, dropout))
+
+    def forward(self, X, valid_lens=None):
+        # 缩放嵌入，使其与位置编码的尺度相匹配
+        X = self.pos_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        for blk in self.blks:
+            X = blk(X, valid_lens)
+        return X
+
+
+class TransformerDecoderBlock(nn.Module):
+    """Transformer解码器块"""
+    def __init__(self, num_hiddens, ffn_num_hiddens, num_heads,
+                 dropout, i, **kwargs):
+        super(TransformerDecoderBlock, self).__init__(**kwargs)
+        self.i = i
+        self.attention1 = MultiHeadAttention(
+            num_hiddens, num_hiddens, num_hiddens, num_hiddens, num_heads,
+            dropout)
+        self.addnorm1 = AddNorm(num_hiddens, dropout)
+        self.attention2 = MultiHeadAttention(
+            num_hiddens, num_hiddens, num_hiddens, num_hiddens, num_heads,
+            dropout)
+        self.addnorm2 = AddNorm(num_hiddens, dropout)
+        self.ffn = PositionWiseFFN(num_hiddens, ffn_num_hiddens, num_hiddens)
+        self.addnorm3 = AddNorm(num_hiddens, dropout)
 
     def forward(self, X, state):
-        enc_outputs, hidden_state, enc_valid_lens = state
-        X = self.embedding(X).permute(1, 0, 2)
-        # 使用解码器最后一层隐藏状态作为query [batch_size, num_hiddens]
-        query = hidden_state[-1].unsqueeze(1)  # [batch_size, 1, num_hiddens]
-        # 为每个解码时间步复制query，使用expand广播 [batch_size, num_steps, num_hiddens]
-        query = query.expand(-1, X.shape[0], -1)
-        outputs, self._attention_weights = self.attention(
-            query, enc_outputs, enc_outputs, enc_valid_lens)
-        X_and_context = torch.cat((outputs.permute(1, 0, 2), X), dim=2)
-        output, hidden_state = self.rnn(X_and_context, hidden_state)
-        output = self.dense(output).permute(1, 0, 2)
-        # 返回完整状态三元组，保持enc_outputs和enc_valid_lens不变
-        return output, (enc_outputs, hidden_state, enc_valid_lens)
+        """
+        X: [batch_size, seq_len, num_hiddens]
+        state: (enc_outputs, enc_valid_lens, [prev_K, prev_V] * num_layers)
+        """
+        enc_outputs, enc_valid_lens = state[0], state[1]
+        
+        # 训练阶段：使用全序列，需要因果掩码
+        # 推理阶段：一次只解码一个token，不需要因果掩码
+        if state[2][self.i] is None:
+            # 推理阶段，没有缓存的key_states
+            key_states = X
+            value_states = X
+        else:
+            # 推理阶段，使用缓存的key_states
+            key_states = torch.cat((state[2][self.i], X), axis=1)
+            value_states = torch.cat((state[3][self.i], X), axis=1)
+        
+        # 更新状态
+        state[2][self.i] = key_states
+        state[3][self.i] = value_states
+        
+        # 自注意力（带因果掩码，防止看到未来信息）
+        if self.training:
+            # 训练时使用因果掩码
+            seq_len = X.shape[1]
+            # 创建上三角掩码（True表示被掩盖）
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=X.device), diagonal=1).bool()
+            # 转置为 [seq_len, seq_len] 用于MultiheadAttention
+            Y, _ = self.attention1(X, key_states, value_states, attn_mask=causal_mask)
+        else:
+            # 推理时不需要因果掩码（一次只输入一个token）
+            Y, _ = self.attention1(X, key_states, value_states)
+        
+        X = self.addnorm1(X, Y)
+        
+        # 编码器-解码器注意力
+        key_padding_mask = None
+        if enc_valid_lens is not None:
+            key_padding_mask = (torch.arange(enc_outputs.shape[1], device=enc_outputs.device)[None, :] >= enc_valid_lens[:, None])
+        
+        Y, _ = self.attention2(X, enc_outputs, enc_outputs, key_padding_mask=key_padding_mask)
+        Y = self.addnorm2(X, Y)
+        
+        return self.addnorm3(Y, self.ffn(Y)), state
 
-    @property
-    def attention_weights(self):
-        return self._attention_weights
 
-# 测试新的注意力解码器
-# decoder = AttentionDecoder(vocab_size=10, embed_size=8, num_hiddens=16,
-#                          num_layers=2)
-# decoder.eval()
-# state = decoder.init_state(encoder(X), None)
-# output, state = decoder(X, state)
-# print("注意力输出形状:", output.shape)
-# print("注意力状态形状:", state.shape)
+class TransformerDecoder(nn.Module):
+    """Transformer解码器"""
+    def __init__(self, vocab_size, num_hiddens, ffn_num_hiddens,
+                 num_heads, num_layers, dropout, **kwargs):
+        super(TransformerDecoder, self).__init__(**kwargs)
+        self.num_hiddens = num_hiddens
+        self.num_layers = num_layers
+        self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.pos_encoding = PositionalEncoding(num_hiddens, dropout)
+        self.blks = nn.Sequential()
+        for i in range(num_layers):
+            self.blks.add_module(f"block{i}",
+                TransformerDecoderBlock(num_hiddens, ffn_num_hiddens,
+                                        num_heads, dropout, i))
+        self.dense = nn.Linear(num_hiddens, vocab_size)
+
+    def init_state(self, enc_outputs, enc_valid_lens):
+        """初始化解码器状态"""
+        # state = (enc_outputs, enc_valid_lens, K缓存列表, V缓存列表)
+        return [enc_outputs, enc_valid_lens, [None] * self.num_layers,
+                [None] * self.num_layers]
+
+    def forward(self, X, state):
+        X = self.pos_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        self._attention_weights = [[None, None] for _ in range(self.num_layers)]
+        for i, blk in enumerate(self.blks):
+            X, state = blk(X, state)
+        return self.dense(X), state
+
 
 class EncoderDecoder(nn.Module):
     """编码器-解码器架构"""
@@ -303,42 +407,11 @@ class EncoderDecoder(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
 
-    def forward(self, enc_X, dec_X, enc_valid_len, *args):
+    def forward(self, enc_X, dec_X, enc_valid_len):
         enc_outputs = self.encoder(enc_X, enc_valid_len)
         dec_state = self.decoder.init_state(enc_outputs, enc_valid_len)
         return self.decoder(dec_X, dec_state)
 
-#==============================处理序列填充============================
-#@save
-def sequence_mask(X, valid_len, value=0):
-    """在序列中屏蔽不相关的项"""
-    maxlen = X.size(1)#获取time steps
-    mask = torch.arange((maxlen), dtype=torch.float32,
-                        device=X.device)[None, :] < valid_len[:, None]
-    X[~mask] = value
-    return X
-
-# X = torch.tensor([[1, 2, 3], [4, 5, 6]])
-# print(sequence_mask(X, torch.tensor([1, 2])))
-
-#@save
-class MaskedSoftmaxCELoss(nn.CrossEntropyLoss):
-    """带遮蔽的softmax交叉熵损失函数"""
-    # pred的形状：(batch_size,num_steps,vocab_size)
-    # label的形状：(batch_size,num_steps)
-    # valid_len的形状：(batch_size,)
-    def forward(self, pred, label, valid_len):
-        weights = torch.ones_like(label)
-        weights = sequence_mask(weights, valid_len)
-        self.reduction='none'
-        unweighted_loss = super(MaskedSoftmaxCELoss, self).forward(
-            pred.permute(0, 2, 1), label)
-        weighted_loss = (unweighted_loss * weights).mean(dim=1)
-        return weighted_loss
-
-loss = MaskedSoftmaxCELoss()
-print("损失:", loss(torch.ones(3, 4, 10), torch.ones((3, 4), dtype=torch.long),
-     torch.tensor([4, 2, 0])))
 
 # ==================== 训练相关工具函数 ====================
 class Accumulator:
@@ -381,6 +454,35 @@ def grad_clipping(net, theta):
         for param in params:
             param.grad[:] *= theta / norm
 
+
+#@save
+def sequence_mask(X, valid_len, value=0):
+    """在序列中屏蔽不相关的项"""
+    maxlen = X.size(1)
+    mask = torch.arange((maxlen), dtype=torch.float32,
+                        device=X.device)[None, :] < valid_len[:, None]
+    X[~mask] = value
+    return X
+
+
+#@save
+class MaskedSoftmaxCELoss(nn.CrossEntropyLoss):
+    """带遮蔽的softmax交叉熵损失函数"""
+    def forward(self, pred, label, valid_len):
+        weights = torch.ones_like(label)
+        weights = sequence_mask(weights, valid_len)
+        self.reduction='none'
+        unweighted_loss = super(MaskedSoftmaxCELoss, self).forward(
+            pred.permute(0, 2, 1), label)
+        weighted_loss = (unweighted_loss * weights).mean(dim=1)
+        return weighted_loss
+
+
+loss = MaskedSoftmaxCELoss()
+print("损失:", loss(torch.ones(3, 4, 10), torch.ones((3, 4), dtype=torch.long),
+     torch.tensor([4, 2, 0])))
+
+
 #@save
 def train_seq2seq(net, data_iter, lr, num_epochs, tgt_vocab, device):
     """训练序列到序列模型"""
@@ -390,10 +492,14 @@ def train_seq2seq(net, data_iter, lr, num_epochs, tgt_vocab, device):
         """Xavier初始化权重"""
         if type(m) == nn.Linear:
             nn.init.xavier_uniform_(m.weight)
-        if type(m) == nn.GRU:
-            for param in m._flat_weights_names:
-                if "weight" in param:
-                    nn.init.xavier_uniform_(m._parameters[param])
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        if type(m) == nn.Embedding:
+            nn.init.xavier_uniform_(m.weight)
+        if type(m) == nn.TransformerEncoderLayer or type(m) == nn.TransformerDecoderLayer:
+            for param in m.parameters():
+                if param.dim() > 1:
+                    nn.init.xavier_uniform_(param)
 
     net.apply(xavier_init_weights)
     net.to(device)
@@ -418,7 +524,7 @@ def train_seq2seq(net, data_iter, lr, num_epochs, tgt_vocab, device):
             dec_input = torch.cat([bos, Y[:, :-1]], 1)  # 强制教学
             Y_hat, _ = net(X, dec_input, X_valid_len)
             l = loss(Y_hat, Y, Y_valid_len)
-            l.sum().backward()      # 损失函数的标量进行"反向传播"
+            l.sum().backward()
             grad_clipping(net, 1)
             num_tokens = Y_valid_len.sum()
             optimizer.step()
@@ -440,6 +546,7 @@ def train_seq2seq(net, data_iter, lr, num_epochs, tgt_vocab, device):
     print(f'loss {metric[0] / metric[1]:.3f}, {metric[1] / timer.stop():.1f} '
         f'tokens/sec on {str(device)}')
 
+
 #@save
 def predict_seq2seq(net, src_sentence, src_vocab, tgt_vocab, num_steps,
                     device, save_attention_weights=False):
@@ -455,19 +562,21 @@ def predict_seq2seq(net, src_sentence, src_vocab, tgt_vocab, num_steps,
     dec_state = net.decoder.init_state(enc_outputs, enc_valid_len)
     dec_X = torch.unsqueeze(torch.tensor(
         [tgt_vocab['<bos>']], dtype=torch.long, device=device), dim=0)
-    output_seq, attention_weight_seq = [], []
+    output_seq = []
     for _ in range(num_steps):
         Y, dec_state = net.decoder(dec_X, dec_state)
-        dec_X = Y.argmax(dim=2)
+        # Y: [batch_size=1, seq_len, vocab_size]
+        # 取最后一个时间步的输出
+        Y = Y[:, -1, :]  # [batch_size=1, vocab_size]
+        dec_X = Y.argmax(dim=1).reshape(-1, 1)  # [batch_size=1, 1]
         pred = dec_X.squeeze(dim=0).type(torch.int32).item()
-        if save_attention_weights:
-            attention_weight_seq.append(net.decoder.attention_weights.cpu().detach().numpy())
         if pred == tgt_vocab['<eos>']:
             break
         output_seq.append(pred)
-    return ' '.join(tgt_vocab.to_tokens(output_seq)), attention_weight_seq
+    return ' '.join(tgt_vocab.to_tokens(output_seq)), None
 
-def bleu(pred_seq, label_seq, k):  #@save
+
+def bleu(pred_seq, label_seq, k):
     """计算BLEU"""
     pred_tokens, label_tokens = pred_seq.split(' '), label_seq.split(' ')
     len_pred, len_label = len(pred_tokens), len(label_tokens)
@@ -483,27 +592,28 @@ def bleu(pred_seq, label_seq, k):  #@save
         score *= math.pow(num_matches / (len_pred - n + 1), math.pow(0.5, n))
     return score
 
+
 # ==================== 训练和评估模型 ====================
-embed_size, num_hiddens, num_layers, dropout = 32, 32, 2, 0.1
+num_hiddens, ffn_num_hiddens, num_layers, num_heads, dropout = 32, 64, 2, 4, 0.1
 batch_size, num_steps = 64, 10
 lr, num_epochs, device = 0.005, 250, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 train_iter, src_vocab, tgt_vocab = load_data_nmt(batch_size, num_steps, num_examples=600)
 
-encoder = Seq2SeqEncoder(len(src_vocab), embed_size, num_hiddens, num_layers, dropout)
-decoder = AttentionDecoder(len(tgt_vocab), embed_size, num_hiddens, num_layers, dropout)
+encoder = TransformerEncoder(len(src_vocab), num_hiddens, ffn_num_hiddens, num_heads, num_layers, dropout)
+decoder = TransformerDecoder(len(tgt_vocab), num_hiddens, ffn_num_hiddens, num_heads, num_layers, dropout)
 net = EncoderDecoder(encoder, decoder)
 
 train_seq2seq(net, train_iter, lr, num_epochs, tgt_vocab, device)
 
 
-# 测试模型并可视化注意力
+# 测试模型
 engs = ['go .', "i lost .", 'he\'s calm .', 'i\'m home .']
 fras = ['va !', 'j\'ai perdu .', 'il est calme .', 'je suis chez moi .']
 
 for i, (eng, fra) in enumerate(zip(engs, fras)):
-    translation, attention_weight_seq = predict_seq2seq(
-        net, eng, src_vocab, tgt_vocab, num_steps, device, True)
+    translation, _ = predict_seq2seq(
+        net, eng, src_vocab, tgt_vocab, num_steps, device)
     
     print(f'\n=== 示例 {i+1} ===')
     print(f'英语: {eng}')
