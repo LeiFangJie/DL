@@ -159,6 +159,7 @@ class VisionTransformer(nn.Module):
 def get_fashion_mnist_loaders(batch_size=128):
     """加载FashionMNIST数据集"""
     transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5), 
         transforms.ToTensor(),
         transforms.Normalize((0.2860,), (0.3530,))  # FashionMNIST的均值和标准差
     ])
@@ -228,7 +229,7 @@ def main():
     # 超参数设置
     batch_size = 128
     epochs = 50
-    lr = 1e-3
+    lr = 5e-4
     
     # 模型参数 (针对28x28的FashionMNIST优化)
     img_size = 28
@@ -262,7 +263,7 @@ def main():
     # 损失函数和优化器
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs/2)
     
     # 训练循环
     best_acc = 0
