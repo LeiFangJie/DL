@@ -245,19 +245,16 @@ class TinySSD(nn.Module):
 
 # ==================== 5. 训练辅助：标签分配与损失 ====================
 
-def multibox_target(anchors, labels, cls_preds=None):
+def multibox_target(anchors, labels):
     """
-    为所有锚框分配真实标签，并执行困难负样本挖掘。
-    
+    为所有锚框分配真实标签。
     参数:
-        anchors:   (1, num_anchors, 4)  角点坐标
-        labels:    (B, num_gt, 5)         [class, xmin, ymin, xmax, ymax]
-        cls_preds: (B, num_anchors, num_classes)  类别预测logits，用于困难负样本挖掘
-                   若为None，则跳过困难负样本挖掘（向后兼容）
+        anchors: (1, num_anchors, 4) 角点坐标
+        labels:  (B, num_gt, 5)      [class, xmin, ymin, xmax, ymax]
     返回:
-        bbox_labels: (B, num_anchors, 4)   偏移量真值
-        bbox_masks:  (B, num_anchors, 4)   正样本掩码（1表示参与定位损失）
-        cls_labels:  (B, num_anchors)      类别标签（0=背景，1~N=物体，-1=忽略）
+        bbox_labels: (B, num_anchors, 4)  偏移量真值
+        bbox_masks:  (B, num_anchors, 4)  正样本掩码（1表示参与定位损失）
+        cls_labels:  (B, num_anchors)     类别标签（0为背景）
     """
     anchors = anchors.squeeze(0)                     # (num_anchors, 4)
     num_anchors = anchors.shape[0]
@@ -268,8 +265,6 @@ def multibox_target(anchors, labels, cls_preds=None):
     bbox_labels = torch.zeros((batch_size, num_anchors, 4), device=device)
     bbox_masks = torch.zeros((batch_size, num_anchors, 4), device=device)
     cls_labels = torch.zeros((batch_size, num_anchors), dtype=torch.long, device=device)
-    # 默认填充 -1（忽略），后面正样本和困难负样本再覆盖
-    cls_labels.fill_(-1)
 
     # 转中心格式 (cx, cy, w, h)，用于 SSD 偏移编码
     anchors_cxcywh = box_corner_to_center(anchors)
@@ -294,12 +289,11 @@ def multibox_target(anchors, labels, cls_preds=None):
         # 每个 GT 最匹配的锚框（强制为正样本，防止漏标）
         anchor_idx_per_gt = iou.argmax(dim=1)         # (num_gt,)
 
-        # 正样本：IoU >= 0.7（提高阈值减少正样本数量），或 是某 GT 的最佳匹配锚框
-        pos_mask = max_iou_per_anchor >= 0.7
+        # 正样本：IoU >= 0.5，或 是某 GT 的最佳匹配锚框
+        pos_mask = max_iou_per_anchor >= 0.5
         pos_mask[anchor_idx_per_gt] = True
-        num_pos = pos_mask.sum().item()
 
-        # 分配正样本类别标签
+        # 分配类别标签
         matched_gt_idx = gt_idx_per_anchor[pos_mask]
         cls_labels[i, pos_mask] = gt_classes[matched_gt_idx]
 
@@ -315,56 +309,21 @@ def multibox_target(anchors, labels, cls_preds=None):
         bbox_labels[i, pos_mask, 2:] = offset_wh
         bbox_masks[i, pos_mask] = 1.0                # 只有正样本参与定位损失
 
-        # ==================== 困难负样本挖掘 ====================
-        if cls_preds is not None and num_pos > 0:
-            # 负样本掩码：IoU < 0.5 且 不是强制正样本
-            neg_mask = (~pos_mask) & (max_iou_per_anchor < 0.5)
-            num_neg = neg_mask.sum().item()
-            
-            if num_neg > 0:
-                # 计算负样本的分类损失（背景类 = 0）
-                neg_cls_logits = cls_preds[i][neg_mask]           # (num_neg, num_classes)
-                neg_targets = torch.zeros(num_neg, dtype=torch.long, device=device)
-                neg_losses = F.cross_entropy(neg_cls_logits, neg_targets, reduction='none')
-                
-                # 选损失最大的 3×num_pos 个困难负样本
-                num_hard_neg = min(3 * num_pos, num_neg)
-                _, hard_neg_idx_in_neg = neg_losses.topk(num_hard_neg)
-                
-                # 将困难负样本标记为 0（背景），参与训练
-                hard_neg_global_idx = torch.nonzero(neg_mask, as_tuple=True)[0]
-                selected_neg_idx = hard_neg_global_idx[hard_neg_idx_in_neg]
-                cls_labels[i, selected_neg_idx] = 0
-
     return bbox_labels, bbox_masks, cls_labels
 
 
-def calc_loss(cls_preds, cls_labels, bbox_preds, bbox_labels, bbox_masks, lambda_bbox=1.5):
-    """
-    总损失 = 分类交叉熵 + λ×定位 Smooth L1（仅正样本）
-    lambda_bbox=1.5 平衡分类和定位
-    """
+def calc_loss(cls_preds, cls_labels, bbox_preds, bbox_labels, bbox_masks, alpha=3.0):
+    """总损失 = 分类损失 + alpha * 定位损失"""
     batch_size, num_classes = cls_preds.shape[0], cls_preds.shape[2]
 
-    # 过滤忽略样本（-1），只计算正样本和困难负样本
-    valid_mask = cls_labels >= 0
-    
-    cls_preds_flat = cls_preds.reshape(-1, num_classes)
-    cls_labels_flat = cls_labels.reshape(-1)
-    valid_flat = valid_mask.reshape(-1)
-    
-    cls = F.cross_entropy(
-        cls_preds_flat[valid_flat], 
-        cls_labels_flat[valid_flat],
-        reduction='none'
-    ).sum() / valid_flat.sum()
+    cls = F.cross_entropy(cls_preds.reshape(-1, num_classes),
+                          cls_labels.reshape(-1),
+                          reduction='none').reshape(batch_size, -1).mean(dim=1)
 
-    # 定位损失加权 λ=1.5
     bbox = F.l1_loss(bbox_preds * bbox_masks, bbox_labels * bbox_masks,
                      reduction='none').mean(dim=(1, 2))
     
-    return cls + lambda_bbox * bbox.mean()
-
+    return cls + alpha * bbox  # 🔥 定位损失权重放大 2 倍
 
 def cls_eval(cls_preds, cls_labels):
     """计算分类正确的样本数"""
@@ -372,18 +331,14 @@ def cls_eval(cls_preds, cls_labels):
 
 
 def bbox_eval(bbox_preds, bbox_labels, bbox_masks):
-    """计算正样本上每个框的平均绝对误差"""
-    per_box_error = torch.abs((bbox_labels - bbox_preds) * bbox_masks).sum(dim=-1)  # (B, num_anchors)
-    num_pos_boxes = (bbox_masks.sum(dim=-1) > 0).sum()  # 正样本框数
-    if num_pos_boxes == 0:
-        return 0.0
-    return per_box_error.sum().item() / num_pos_boxes.item()
+    """计算正样本上的边界框绝对误差之和"""
+    return torch.abs((bbox_labels - bbox_preds) * bbox_masks).sum().item()
 
 
 # ==================== 6. 推理：NMS 与可视化 ====================
 
 def multibox_detection(cls_probs, offset_preds, anchors,
-                       nms_threshold=0.5, pos_threshold=0.01):
+                       nms_threshold=0.2, pos_threshold=0.01):
     """
     后处理：将网络输出解码为最终检测框，并做 NMS 去重。
     参数:
@@ -440,23 +395,19 @@ def multibox_detection(cls_probs, offset_preds, anchors,
     return torch.stack(padded)
 
 
-def predict(X, net, device, top_k=1):
-    """只保留置信度最高的 top_k 个框"""
+def predict(X, net, device):
+    """对单张图片做预测，返回过滤后的检测框"""
     net.eval()
     with torch.no_grad():
         anchors, cls_preds, bbox_preds = net(X.to(device))
         cls_probs = F.softmax(cls_preds, dim=-1)
         output = multibox_detection(cls_probs, bbox_preds, anchors)
+    # 去掉填充的无效框（class == -1）
     idx = [i for i, row in enumerate(output[0]) if row[0] != -1]
-    result = output[0, idx] if idx else torch.zeros((0, 6), device=device)
-    
-    # 🔥 只保留 top_k
-    if len(result) > top_k:
-        result = result[result[:, 1].sort(descending=True)[1][:top_k]]
-    return result
+    return output[0, idx] if idx else torch.zeros((0, 6), device=device)
 
 
-def display(img, output, threshold=0.7):
+def display(img, output, threshold=0.9):
     """在图像上绘制检测结果"""
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.imshow(img)
@@ -479,99 +430,52 @@ def display(img, output, threshold=0.7):
     plt.show()
 
 
-# ==================== 模型保存路径 ====================
-MODEL_PATH = 'ssd_best_model.pth'
-
-
-def save_model(net, optimizer, epoch, metric, path=MODEL_PATH):
-    """保存模型状态（网络参数 + 优化器 + 训练进度）"""
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': net.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'cls_err': metric[0],
-        'bbox_mae': metric[1],
-    }, path)
-    print(f'模型已保存到 {path}')
-
-
-def load_model(net, optimizer=None, path=MODEL_PATH):
-    """加载模型状态，返回是否成功"""
-    if not os.path.exists(path):
-        return False, None
-    
-    checkpoint = torch.load(path, map_location=device)
-    net.load_state_dict(checkpoint['model_state_dict'])
-    
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    epoch = checkpoint.get('epoch', 0)
-    print(f'从 {path} 加载模型（训练了 {epoch} 个 epoch）')
-    print(f'  历史指标: cls_err={checkpoint["cls_err"]:.2e}, bbox_mae={checkpoint["bbox_mae"]:.2e}')
-    return True, epoch
-
-
-# ==================== 修改后的主程序 ====================
+# ==================== 7. 训练循环 ====================
 
 if __name__ == '__main__':
     batch_size = 32
-    train_iter, val_iter = load_data_bananas(batch_size)
+    train_iter, _ = load_data_bananas(batch_size)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     net = TinySSD(num_classes=1).to(device)
     optimizer = torch.optim.SGD(net.parameters(), lr=0.2, weight_decay=5e-4)
 
-    # 🔥 检查是否存在已保存的模型
-    loaded, start_epoch = load_model(net, optimizer, MODEL_PATH)
-    
-    if loaded:
-        # 有模型，跳过训练，直接推理
-        print('已有训练好的模型，跳过训练...')
-    else:
-        # 没有模型，执行训练
-        print('未找到模型，开始训练...')
-        num_epochs = 100
-        net.train()
-        
-        best_metric = float('inf')  # 跟踪最佳 bbox_mae
-        
-        for epoch in range(num_epochs):
-            metric = [0.0] * 4  # [分类正确数, 有效样本总数, 框误差和, 正样本框数]
-            start = time.time()
+    num_epochs = 50
+    net.train()
 
-            for features, target in train_iter:
-                optimizer.zero_grad()
-                X, Y = features.to(device), target.to(device)
+    for epoch in range(num_epochs):
+        # metric: [分类正确数, 分类总数, 框误差和, 正样本数]
+        metric = [0.0] * 4
+        start = time.time()
 
-                anchors, cls_preds, bbox_preds = net(X)
-                bbox_labels, bbox_masks, cls_labels = multibox_target(anchors, Y, cls_preds)
-                
-                l = calc_loss(cls_preds, cls_labels, bbox_preds, bbox_labels, bbox_masks, lambda_bbox=1.5)
-                l.backward()
-                optimizer.step()
+        for features, target in train_iter:
+            optimizer.zero_grad()
+            X, Y = features.to(device), target.to(device)
 
-                metric[0] += cls_eval(cls_preds, cls_labels)
-                metric[1] += (cls_labels >= 0).sum().item()
-                metric[2] += bbox_eval(bbox_preds, bbox_labels, bbox_masks)
-                metric[3] += (bbox_masks.sum(dim=-1) > 0).sum().item()
+            # 前向：生成锚框 + 类别预测 + 框偏移预测
+            anchors, cls_preds, bbox_preds = net(X)
 
-            cls_err = 1 - metric[0] / metric[1]
-            bbox_mae = metric[2] / max(metric[3], 1)
-            print(f'Epoch {epoch + 1}: class err {cls_err:.2e}, bbox mae {bbox_mae:.2e}, '
-                  f'pos_boxes {metric[3]:.0f}, time {time.time() - start:.1f}s')
+            # 标签分配：根据 GT 为每个锚框打标签（正/负样本）
+            bbox_labels, bbox_masks, cls_labels = multibox_target(anchors, Y)
 
-            # 🔥 保存最佳模型（以 bbox_mae 为指标）
-            if bbox_mae < best_metric:
-                best_metric = bbox_mae
-                save_model(net, optimizer, epoch + 1, (cls_err, bbox_mae), MODEL_PATH)
+            # 计算损失并反向传播
+            l = calc_loss(cls_preds, cls_labels, bbox_preds, bbox_labels, bbox_masks)
+            l.mean().backward()
+            optimizer.step()
 
-    # ==================== 推理 ====================
-    X = torchvision.io.read_image(
-        r'D:\FAFU_work\data\banana-detection\bananas_val\images\10.png'
-    ).unsqueeze(0).float()
-    
+            # 统计指标
+            metric[0] += cls_eval(cls_preds, cls_labels)
+            metric[1] += cls_labels.numel()
+            metric[2] += bbox_eval(bbox_preds, bbox_labels, bbox_masks)
+            metric[3] += bbox_masks.sum().item()
+
+        cls_err = 1 - metric[0] / metric[1]
+        bbox_mae = metric[2] / metric[3]
+        print(f'Epoch {epoch + 1}: class err {cls_err:.2e}, bbox mae {bbox_mae:.2e}, '
+              f'time {time.time() - start:.1f}s')
+
+    # ==================== 8. 预测示例 ====================
+    X = torchvision.io.read_image(r"D:\FAFU_work\data\banana-detection\bananas_val\images\10.png").unsqueeze(0).float()
     img = X.squeeze(0).permute(1, 2, 0).long()
     output = predict(X, net, device)
-    print(f"预测框数量: {len(output)}, 置信度: {output[:, 1].tolist() if len(output) > 0 else '无'}")
     display(img, output.cpu(), threshold=0.9)
