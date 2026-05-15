@@ -317,7 +317,7 @@ def display(img_tensor, output, threshold=0.5):
 
 def main():
     BATCH_SIZE = 4
-    NUM_EPOCHS = 20
+    NUM_EPOCHS = 10
     NUM_CLASSES = 2         # 香蕉 + 背景
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
