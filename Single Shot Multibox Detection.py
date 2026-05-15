@@ -475,7 +475,7 @@ if __name__ == '__main__':
               f'time {time.time() - start:.1f}s')
 
     # ==================== 8. 预测示例 ====================
-    X = torchvision.io.read_image(r"D:\FAFU_work\data\banana-detection\bananas_val\images\10.png").unsqueeze(0).float()
+    X = torchvision.io.read_image(r"D:\FAFU_work\data\banana-detection\bananas_val\images\30.png").unsqueeze(0).float()
     img = X.squeeze(0).permute(1, 2, 0).long()
     output = predict(X, net, device)
     display(img, output.cpu(), threshold=0.9)
