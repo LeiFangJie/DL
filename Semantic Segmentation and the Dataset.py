@@ -4,6 +4,12 @@ import torchvision
 from torchvision.datasets import VOCSegmentation
 import matplotlib.pyplot as plt
 import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from IPython import display
+import matplotlib.pyplot as plt
+import time
+from tqdm import tqdm
 
 # 自动下载并解压到指定目录
 # year='2012', image_set='trainval' 对应 VOCtrainval_11-May-2012.tar
@@ -35,7 +41,6 @@ def read_voc_images(voc_dir, is_train=True):
             voc_dir, 'SegmentationClass' ,f'{fname}.png'), mode))
     return features, labels
 
-train_features, train_labels = read_voc_images(voc_dir, True)
 
 #@save
 VOC_COLORMAP = [[0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
@@ -164,3 +169,197 @@ def load_data_voc(batch_size, crop_size, voc_dir='../data/VOCdevkit/VOC2012', nu
         drop_last=True, num_workers=num_workers)
     return train_iter, test_iter#没有数据泄露，再read_voc_images函数里有定义train.txt和val.txt来读取不同的文件
 
+
+#====================model ========================
+pretrained_net = torchvision.models.resnet18(weights=("pretrained", torchvision.models.ResNet18_Weights.DEFAULT))
+
+net = nn.Sequential(*list(pretrained_net.children())[:-2])
+#print(list(net.children()))
+
+X = torch.rand(size=(1, 3, 320, 480))
+print(net(X).shape)
+
+num_classes = 21
+net.add_module('final_conv', nn.Conv2d(512, num_classes, kernel_size=1))#21个kernel1*1卷积将通道融合，输出就是(B,21,H/32,W/32)
+net.add_module('transpose_conv', nn.ConvTranspose2d(num_classes, num_classes,
+                                    kernel_size=64, padding=16, stride=32))
+
+X = torch.rand(size=(1, 3, 320, 480))
+print(net(X).shape)
+
+#用双线性插值初始化转置卷积
+def bilinear_kernel(in_channels, out_channels, kernel_size):
+    factor = (kernel_size + 1) // 2
+    if kernel_size % 2 == 1:
+        center = factor - 1
+    else:
+        center = factor - 0.5
+    og = (torch.arange(kernel_size).reshape(-1, 1),
+          torch.arange(kernel_size).reshape(1, -1))
+    filt = (1 - torch.abs(og[0] - center) / factor) * \
+           (1 - torch.abs(og[1] - center) / factor)
+    weight = torch.zeros((in_channels, out_channels,
+                          kernel_size, kernel_size))
+    weight[range(in_channels), range(out_channels), :, :] = filt
+    return weight
+
+W = bilinear_kernel(num_classes, num_classes, 64)
+net.transpose_conv.weight.data.copy_(W)
+
+
+# ==================== 工具类（替代 d2l.Timer / Accumulator / Animator） ====================
+
+class Timer:
+    def __init__(self):
+        self.times = []
+        self.start()
+    def start(self):
+        self.tik = time.time()
+    def stop(self):
+        self.times.append(time.time() - self.tik)
+        return self.times[-1]
+    def sum(self):
+        return sum(self.times)
+
+class Accumulator:
+    def __init__(self, n):
+        self.data = [0.0] * n
+    def add(self, *args):
+        self.data = [
+            a + (b.detach().item() if isinstance(b, torch.Tensor) else float(b))
+            for a, b in zip(self.data, args)
+        ]
+    def reset(self):
+        self.data = [0.0] * len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def try_all_gpus():
+    devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
+    return devices if devices else [torch.device('cpu')]
+
+def accuracy(y_hat, y):
+    if len(y_hat.shape) > 1 and y_hat.shape[1] > 1:
+        y_hat = y_hat.argmax(dim=1)
+    cmp = y_hat.type(y.dtype) == y
+    return float(cmp.type(y.dtype).sum())
+
+def evaluate_accuracy_gpu(net, data_iter, device=None):
+    if not device:
+        device = next(iter(net.parameters())).device
+    net.eval()
+    metric = Accumulator(2)
+    with torch.no_grad():
+        for X, y in data_iter:
+            X, y = X.to(device), y.to(device)
+            metric.add(accuracy(net(X), y), y.numel())
+    return metric[0] / metric[1]
+
+def train_batch_ch13(net, X, y, loss, trainer, devices):
+    if isinstance(X, list):
+        X = [x.to(devices[0]) for x in X]
+    else:
+        X = X.to(devices[0])
+    y = y.to(devices[0])
+    net.train()
+    trainer.zero_grad()
+    pred = net(X)
+    l = loss(pred, y)
+    l.sum().backward()
+    trainer.step()
+    return l.sum().detach(), accuracy(pred, y)
+
+def train_ch13(net, train_iter, test_iter, loss, trainer, num_epochs, devices=None):
+    if devices is None:
+        devices = try_all_gpus()
+    
+    timer = Timer()
+    
+    if len(devices) > 1:
+        net = nn.DataParallel(net, device_ids=devices).to(devices[0])
+    else:
+        net = net.to(devices[0])
+    
+    for epoch in tqdm(range(num_epochs), desc="Epoch"):
+        metric = Accumulator(4)
+        pbar = tqdm(train_iter, desc=f"Train [{epoch+1}/{num_epochs}]", leave=False)
+        
+        for features, labels in pbar:
+            timer.start()
+            l, acc = train_batch_ch13(net, features, labels, loss, trainer, devices)
+            metric.add(l, acc, labels.shape[0], labels.numel())
+            timer.stop()
+            
+            pbar.set_postfix({
+                'loss': f'{metric[0]/metric[2]:.3f}',
+                'train_acc': f'{metric[1]/metric[3]:.3f}'
+            })
+        
+        test_acc = evaluate_accuracy_gpu(net, test_iter)
+        tqdm.write(f'[Epoch {epoch+1}/{num_epochs}] '
+                   f'loss {metric[0]/metric[2]:.3f}, '
+                   f'train acc {metric[1]/metric[3]:.3f}, '
+                   f'test acc {test_acc:.3f}')
+    
+    print(f'\nFinal: loss {metric[0]/metric[2]:.3f}, train acc {metric[1]/metric[3]:.3f}, test acc {test_acc:.3f}')
+    print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec on {str(devices)}')
+
+
+batch_size, crop_size = 32, (320, 480)
+train_iter, test_iter = load_data_voc(batch_size, crop_size)
+
+def loss(inputs, targets):
+    return F.cross_entropy(inputs, targets, reduction='none').mean(1).mean(1)
+
+num_epochs, lr, wd, devices = 20, 0.001, 1e-3, try_all_gpus()
+trainer = torch.optim.SGD(net.parameters(), lr=lr, weight_decay=wd)
+train_ch13(net, train_iter, test_iter, loss, trainer, num_epochs, devices)
+
+def predict(img):
+    X = test_iter.dataset.normalize_image(img).unsqueeze(0)#(1, 3, 320, 480)
+    pred = net(X.to(devices[0])).argmax(dim=1)#(1, 21, H/32, W/32) -> (1, H/32, W/32)
+    return pred.reshape(pred.shape[1], pred.shape[2])#(1, H/32, W/32) -> (H/32, W/32)
+
+def label2image(pred):
+    colormap = torch.tensor(VOC_COLORMAP, device=devices[0])#(21, 3)
+    X = pred.long()#(H/32, W/32)
+    return colormap[X, :]#(21, 3)[(H/32, W/32)] -> (H/32, W/32, 3)
+
+test_images, test_labels = read_voc_images(voc_dir, False)
+n, imgs = 4, []
+for i in range(n):
+    crop_rect = (0, 0, 320, 480)
+    X = torchvision.transforms.functional.crop(test_images[i], *crop_rect)
+    pred = label2image(predict(X))
+    imgs += [
+        X.permute(1, 2, 0),
+        pred.cpu(),
+        torchvision.transforms.functional.crop(
+            test_labels[i], *crop_rect).permute(1, 2, 0)
+    ]
+
+# ========== 替换 d2l.show_images 开始 ==========
+display_imgs = imgs[::3] + imgs[1::3] + imgs[2::3]
+
+fig, axes = plt.subplots(3, n, figsize=(n * 2.5, 3 * 2.5))
+for i, ax in enumerate(axes.flat):
+    img = display_imgs[i]
+    
+    # 统一转成 numpy
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+    
+    # 原图经过 Normalize，值可能不在 [0,1]，clamp 一下防止显示异常
+    if img.dtype in (np.float32, np.float64):
+        img = np.clip(img, 0, 1)
+    
+    ax.imshow(img)
+    ax.axis('off')
+
+# 给每行加标题
+titles = ['Input Image', 'Predicted', 'True Label']
+for row, title in enumerate(titles):
+    axes[row, 0].set_ylabel(title, fontsize=12, rotation=0, labelpad=60, va='center')
+
+plt.tight_layout()
+plt.show()
